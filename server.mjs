@@ -438,12 +438,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return a === "Card debit" || a === "Spending cashback" || a === "Card credit";
     });
 
-    // NOTE: Budget tool should ideally dedup; this MCP only avoids re-import if it can.
-    // We still do a lightweight memo-based dedup to prevent obvious duplicates.
-    const recent = shJson("mcporter", ["call", `budget.read_transactions(account_id:\"${budgetAccountId}\", limit:200, offset:0)`]);
-    const recentItems = Array.isArray(recent?.transactions) ? recent.transactions : Array.isArray(recent) ? recent : [];
-    const memoSet = new Set(recentItems.map((t) => String(t?.memo ?? "")));
-
+    // No dedup here by design (Martin preference). Budget tool should dedup based on memo/amount/etc.
     const imported = [];
     const skipped = [];
 
@@ -452,10 +447,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const memo = `t212:${id}`;
       if (!id) {
         skipped.push({ id, reason: "missing id", row: r });
-        continue;
-      }
-      if (memoSet.has(memo) || [...memoSet].some((m) => m.startsWith(memo))) {
-        skipped.push({ id, reason: "already imported", row: r });
         continue;
       }
 
