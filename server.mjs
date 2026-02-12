@@ -3,6 +3,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { execFileSync } from "node:child_process";
 
 const T212_ENV = process.env.TRADING212_ENV ?? "demo"; // demo | live
 const T212_API_KEY = process.env.TRADING212_API_KEY;
@@ -55,10 +56,138 @@ async function t212Fetch(path, { method = "GET", searchParams, body } = {}) {
   }
 }
 
-const server = new Server(
-  { name: "trading212-mcp", version: "0.1.0" },
-  { capabilities: { tools: {} } }
-);
+function parseCsv(text) {
+  // Minimal RFC4180-ish CSV parser (supports quoted fields + commas + escaped quotes)
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+
+    if (inQuotes) {
+      if (c === '"') {
+        const next = text[i + 1];
+        if (next === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += c;
+      }
+      continue;
+    }
+
+    if (c === '"') {
+      inQuotes = true;
+      continue;
+    }
+
+    if (c === ",") {
+      row.push(field);
+      field = "";
+      continue;
+    }
+
+    if (c === "\n") {
+      row.push(field);
+      field = "";
+      // trim CR
+      if (row.length === 1 && row[0] === "") {
+        row = [];
+        continue;
+      }
+      rows.push(row.map((s) => (s.endsWith("\r") ? s.slice(0, -1) : s)));
+      row = [];
+      continue;
+    }
+
+    field += c;
+  }
+
+  // last line
+  if (field.length || row.length) {
+    row.push(field);
+    rows.push(row.map((s) => (s.endsWith("\r") ? s.slice(0, -1) : s)));
+  }
+
+  if (!rows.length) return { header: [], rows: [] };
+  const header = rows[0];
+  const dataRows = rows.slice(1);
+  const objects = dataRows
+    .filter((r) => r.some((x) => String(x ?? "").trim() !== ""))
+    .map((r) => {
+      const o = {};
+      for (let j = 0; j < header.length; j++) o[header[j]] = r[j] ?? "";
+      return o;
+    });
+  return { header, rows: objects };
+}
+
+async function requestTransactionsReport({ timeFrom, timeTo }) {
+  const payload = {
+    timeFrom,
+    timeTo,
+    dataIncluded: {
+      includeDividends: false,
+      includeInterest: false,
+      includeOrders: false,
+      includeTransactions: true,
+    },
+  };
+
+  const enq = await t212Fetch("/equity/history/exports", { method: "POST", body: payload });
+  if (!enq?.reportId) throw new Error(`Unexpected response from exports POST: ${JSON.stringify(enq).slice(0, 500)}`);
+  return enq.reportId;
+}
+
+async function listReports() {
+  const reports = await t212Fetch("/equity/history/exports");
+  if (!Array.isArray(reports)) throw new Error(`Unexpected response from exports GET: ${JSON.stringify(reports).slice(0, 500)}`);
+  return reports;
+}
+
+async function getReportById(reportId) {
+  const reports = await listReports();
+  const hit = reports.find((r) => String(r.reportId) === String(reportId));
+  return hit ?? null;
+}
+
+async function fetchTransactionsCsv({ timeFrom, timeTo, waitSeconds = 20 }) {
+  const reportId = await requestTransactionsReport({ timeFrom, timeTo });
+
+  const deadline = Date.now() + waitSeconds * 1000;
+  let report = null;
+  while (Date.now() < deadline) {
+    report = await getReportById(reportId);
+    if (report?.status === "Finished" && report?.downloadLink) break;
+    // avoid hammering the 1/min limit: sleep 5s
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+
+  if (!report?.downloadLink) {
+    return { reportId, status: report?.status ?? "Unknown", downloadLink: report?.downloadLink ?? null, csv: null };
+  }
+
+  const res = await fetch(report.downloadLink);
+  const csvText = await res.text();
+  if (!res.ok) throw new Error(`CSV download failed ${res.status}: ${csvText.slice(0, 300)}`);
+  return { reportId, status: report.status, downloadLink: report.downloadLink, csv: csvText };
+}
+
+function shJson(cmd, args) {
+  const out = execFileSync(cmd, args, { encoding: "utf8" });
+  try {
+    return JSON.parse(out);
+  } catch {
+    return out;
+  }
+}
+
+const server = new Server({ name: "trading212-mcp", version: "0.2.0" }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -95,26 +224,89 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "t212_place_order",
+        name: "t212_place_order_market",
         description:
-          "Place an order (best-effort wrapper; requires TRADING212_ALLOW_TRADING=true). Quantity <0 sells. Fields depend on Trading212 API.",
+          "Place a MARKET order (requires TRADING212_ALLOW_TRADING=true). Quantity <0 sells.",
         inputSchema: {
           type: "object",
           properties: {
-            ticker: { type: "string", description: "Instrument ticker, e.g. AAPL_US_EQ" },
-            quantity: { type: "number", description: "Shares quantity. Negative = sell." },
-            limitPrice: { type: "number", description: "Optional limit price" },
-            stopPrice: { type: "number", description: "Optional stop price" },
-            timeValidity: { type: "string", description: "Optional time validity (e.g. DAY/GTC depending on API)" },
-            extendedHours: { type: "boolean", description: "Optional" },
+            ticker: { type: "string" },
+            quantity: { type: "number", description: "Negative quantity = sell" },
+            extendedHours: { type: "boolean" },
           },
           required: ["ticker", "quantity"],
         },
       },
       {
-        name: "t212_instruments_exchanges",
-        description: "List exchanges (if supported by the API version).",
-        inputSchema: { type: "object", properties: {} },
+        name: "t212_place_order_limit",
+        description: "Place a LIMIT order (requires TRADING212_ALLOW_TRADING=true). Quantity <0 sells.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ticker: { type: "string" },
+            quantity: { type: "number" },
+            limitPrice: { type: "number" },
+            timeValidity: { type: "string", description: "DAY|GTC (depends on API)" },
+          },
+          required: ["ticker", "quantity", "limitPrice"],
+        },
+      },
+      {
+        name: "t212_history_transactions",
+        description:
+          "Fetch movements (deposit/withdraw/fee/transfer) via /equity/history/transactions (NOT card-level merchant details).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            limit: { type: "number", description: "Max 50" },
+            cursor: { type: "string" },
+            time: { type: "string", description: "Start time (ISO)" },
+          },
+        },
+      },
+      {
+        name: "t212_export_transactions_csv",
+        description:
+          "Generate and download the Transactions CSV export (contains card debits incl. merchant/category).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            timeFrom: { type: "string", description: "ISO datetime" },
+            timeTo: { type: "string", description: "ISO datetime" },
+            waitSeconds: { type: "number", description: "Max wait for report completion (default 20)" },
+          },
+          required: ["timeFrom", "timeTo"],
+        },
+      },
+      {
+        name: "t212_card_transactions",
+        description:
+          "Return only card-related rows (Card debit / Spending cashback) from the Transactions CSV export.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            timeFrom: { type: "string" },
+            timeTo: { type: "string" },
+            waitSeconds: { type: "number" },
+          },
+          required: ["timeFrom", "timeTo"],
+        },
+      },
+      {
+        name: "t212_budget_import_card_transactions",
+        description:
+          "Import card-related rows into Budget via budget.add_transaction. Uses memo 't212:<ID>' for dedup. Dry-run by default.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            budgetAccountId: { type: "string", description: "Budget account UUID" },
+            timeFrom: { type: "string" },
+            timeTo: { type: "string" },
+            dryRun: { type: "boolean", description: "Default true" },
+            waitSeconds: { type: "number" },
+          },
+          required: ["budgetAccountId", "timeFrom", "timeTo"],
+        },
       },
       {
         name: "t212_raw",
@@ -156,42 +348,144 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   if (name === "t212_cancel_order") {
-    if (!T212_ALLOW_TRADING) throw new Error("Trading disabled. Set TRADING212_ALLOW_TRADING=true to allow cancelling/placing orders.");
+    if (!T212_ALLOW_TRADING) throw new Error("Trading disabled. Set TRADING212_ALLOW_TRADING=true.");
     const schema = z.object({ id: z.number().int().positive() });
     const { id } = schema.parse(args);
     const data = await t212Fetch(`/equity/orders/${id}`, { method: "DELETE" });
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
 
-  if (name === "t212_place_order") {
-    if (!T212_ALLOW_TRADING) throw new Error("Trading disabled. Set TRADING212_ALLOW_TRADING=true to allow cancelling/placing orders.");
-    const schema = z.object({
-      ticker: z.string().min(1),
-      quantity: z.number(),
-      limitPrice: z.number().optional(),
-      stopPrice: z.number().optional(),
-      timeValidity: z.string().optional(),
-      extendedHours: z.boolean().optional(),
-    });
-    const { ticker, quantity, limitPrice, stopPrice, timeValidity, extendedHours } = schema.parse(args);
-
-    // NOTE: This payload is based on the public docs conventions, but may need adjusting.
-    const payload = {
-      ticker,
-      quantity,
-      ...(limitPrice !== undefined ? { limitPrice } : {}),
-      ...(stopPrice !== undefined ? { stopPrice } : {}),
-      ...(timeValidity !== undefined ? { timeValidity } : {}),
-      ...(extendedHours !== undefined ? { extendedHours } : {}),
-    };
-
-    const data = await t212Fetch("/equity/orders", { method: "POST", body: payload });
+  if (name === "t212_place_order_market") {
+    if (!T212_ALLOW_TRADING) throw new Error("Trading disabled. Set TRADING212_ALLOW_TRADING=true.");
+    const schema = z.object({ ticker: z.string().min(1), quantity: z.number(), extendedHours: z.boolean().optional() });
+    const { ticker, quantity, extendedHours } = schema.parse(args);
+    const payload = { ticker, quantity, ...(extendedHours !== undefined ? { extendedHours } : {}) };
+    const data = await t212Fetch("/equity/orders/market", { method: "POST", body: payload });
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
 
-  if (name === "t212_instruments_exchanges") {
-    const data = await t212Fetch("/equity/instruments/exchanges");
+  if (name === "t212_place_order_limit") {
+    if (!T212_ALLOW_TRADING) throw new Error("Trading disabled. Set TRADING212_ALLOW_TRADING=true.");
+    const schema = z.object({
+      ticker: z.string().min(1),
+      quantity: z.number(),
+      limitPrice: z.number(),
+      timeValidity: z.string().optional(),
+    });
+    const { ticker, quantity, limitPrice, timeValidity } = schema.parse(args);
+    const payload = { ticker, quantity, limitPrice, ...(timeValidity ? { timeValidity } : {}) };
+    const data = await t212Fetch("/equity/orders/limit", { method: "POST", body: payload });
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  }
+
+  if (name === "t212_history_transactions") {
+    const schema = z.object({ limit: z.number().int().positive().max(50).optional(), cursor: z.string().optional(), time: z.string().optional() }).optional();
+    const { limit, cursor, time } = schema?.parse(args) ?? {};
+    const data = await t212Fetch("/equity/history/transactions", { searchParams: { limit, cursor, time } });
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  }
+
+  if (name === "t212_export_transactions_csv") {
+    const schema = z.object({ timeFrom: z.string().min(10), timeTo: z.string().min(10), waitSeconds: z.number().int().positive().max(300).optional() });
+    const { timeFrom, timeTo, waitSeconds = 20 } = schema.parse(args);
+    const out = await fetchTransactionsCsv({ timeFrom, timeTo, waitSeconds });
+    return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+  }
+
+  if (name === "t212_card_transactions") {
+    const schema = z.object({ timeFrom: z.string().min(10), timeTo: z.string().min(10), waitSeconds: z.number().int().positive().max(300).optional() });
+    const { timeFrom, timeTo, waitSeconds = 20 } = schema.parse(args);
+    const out = await fetchTransactionsCsv({ timeFrom, timeTo, waitSeconds });
+    if (!out.csv) return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+
+    const parsed = parseCsv(out.csv);
+    const rows = parsed.rows;
+
+    const cardRows = rows.filter((r) => {
+      const a = (r.Action ?? "").trim();
+      return a === "Card debit" || a === "Spending cashback" || a === "Card credit";
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ reportId: out.reportId, timeFrom, timeTo, count: cardRows.length, items: cardRows }, null, 2),
+        },
+      ],
+    };
+  }
+
+  if (name === "t212_budget_import_card_transactions") {
+    const schema = z.object({
+      budgetAccountId: z.string().min(10),
+      timeFrom: z.string().min(10),
+      timeTo: z.string().min(10),
+      dryRun: z.boolean().optional(),
+      waitSeconds: z.number().int().positive().max(300).optional(),
+    });
+    const { budgetAccountId, timeFrom, timeTo, dryRun = true, waitSeconds = 20 } = schema.parse(args);
+
+    const out = await fetchTransactionsCsv({ timeFrom, timeTo, waitSeconds });
+    if (!out.csv) {
+      return { content: [{ type: "text", text: JSON.stringify({ ...out, dryRun }, null, 2) }] };
+    }
+
+    const parsed = parseCsv(out.csv);
+    const rows = parsed.rows;
+    const cardRows = rows.filter((r) => {
+      const a = (r.Action ?? "").trim();
+      return a === "Card debit" || a === "Spending cashback" || a === "Card credit";
+    });
+
+    // Dedup: read recent budget transactions and look for memo containing t212:<ID>
+    const recent = shJson("mcporter", ["call", `budget.read_transactions(account_id:\"${budgetAccountId}\", limit:200, offset:0)`]);
+    const recentItems = Array.isArray(recent?.transactions) ? recent.transactions : Array.isArray(recent) ? recent : [];
+    const memoSet = new Set(recentItems.map((t) => String(t?.memo ?? "")));
+
+    const imported = [];
+    const skipped = [];
+
+    for (const r of cardRows) {
+      const id = String(r.ID ?? r.Id ?? "").trim();
+      const memo = `t212:${id}`;
+      if (!id || memoSet.has(memo)) {
+        skipped.push({ id, reason: !id ? "missing id" : "already imported", row: r });
+        continue;
+      }
+
+      // CSV columns:
+      // Action,Time,Notes,ID,Total,Currency (Total),Merchant name,Merchant category
+      const time = String(r.Time ?? "").trim();
+      const date = time.slice(0, 10); // YYYY-MM-DD
+      const payee = String(r["Merchant name"] ?? "").replace(/\s+/g, " ").trim() || undefined;
+      const amountStr = String(r.Total ?? "").replace(/,/g, ".").trim();
+      const amount = Number(amountStr);
+      if (!Number.isFinite(amount)) {
+        skipped.push({ id, reason: `bad amount: ${amountStr}`, row: r });
+        continue;
+      }
+
+      if (dryRun) {
+        imported.push({ id, dryRun: true, date, payee, amount, memo });
+        continue;
+      }
+
+      // Call budget.add_transaction
+      // Use --args to include memo (and leave category empty for now).
+      const argsObj = { account_id: budgetAccountId, date, payee, amount, memo, cleared: "cleared" };
+      const res = shJson("mcporter", ["call", "budget.add_transaction", "--args", JSON.stringify(argsObj)]);
+      imported.push({ id, date, payee, amount, memo, result: res });
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ reportId: out.reportId, timeFrom, timeTo, dryRun, importedCount: imported.length, skippedCount: skipped.length, imported, skipped }, null, 2),
+        },
+      ],
+    };
   }
 
   if (name === "t212_raw") {
@@ -202,11 +496,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       body: z.record(z.any()).optional(),
     });
     const { path, method = "GET", query, body } = schema.parse(args);
-    const data = await t212Fetch(path, {
-      method: method.toUpperCase(),
-      searchParams: query,
-      body,
-    });
+    const data = await t212Fetch(path, { method: method.toUpperCase(), searchParams: query, body });
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
 
