@@ -438,7 +438,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return a === "Card debit" || a === "Spending cashback" || a === "Card credit";
     });
 
-    // Dedup: read recent budget transactions and look for memo containing t212:<ID>
+    // NOTE: Budget tool should ideally dedup; this MCP only avoids re-import if it can.
+    // We still do a lightweight memo-based dedup to prevent obvious duplicates.
     const recent = shJson("mcporter", ["call", `budget.read_transactions(account_id:\"${budgetAccountId}\", limit:200, offset:0)`]);
     const recentItems = Array.isArray(recent?.transactions) ? recent.transactions : Array.isArray(recent) ? recent : [];
     const memoSet = new Set(recentItems.map((t) => String(t?.memo ?? "")));
@@ -449,8 +450,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     for (const r of cardRows) {
       const id = String(r.ID ?? r.Id ?? "").trim();
       const memo = `t212:${id}`;
-      if (!id || memoSet.has(memo)) {
-        skipped.push({ id, reason: !id ? "missing id" : "already imported", row: r });
+      if (!id) {
+        skipped.push({ id, reason: "missing id", row: r });
+        continue;
+      }
+      if (memoSet.has(memo) || [...memoSet].some((m) => m.startsWith(memo))) {
+        skipped.push({ id, reason: "already imported", row: r });
         continue;
       }
 
@@ -458,7 +463,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Action,Time,Notes,ID,Total,Currency (Total),Merchant name,Merchant category
       const time = String(r.Time ?? "").trim();
       const date = time.slice(0, 10); // YYYY-MM-DD
-      const payee = String(r["Merchant name"] ?? "").replace(/\s+/g, " ").trim() || undefined;
+      // Martin preference: do NOT set payee. Put merchant into memo.
+      const merchant = String(r["Merchant name"] ?? "").replace(/\s+/g, " ").trim();
       const amountStr = String(r.Total ?? "").replace(/,/g, ".").trim();
       const amount = Number(amountStr);
       if (!Number.isFinite(amount)) {
@@ -466,16 +472,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         continue;
       }
 
+      const memoFull = merchant ? `${memo} | ${merchant}` : memo;
+
       if (dryRun) {
-        imported.push({ id, dryRun: true, date, payee, amount, memo });
+        imported.push({ id, dryRun: true, date, amount, memo: memoFull });
         continue;
       }
 
       // Call budget.add_transaction
-      // Use --args to include memo (and leave category empty for now).
-      const argsObj = { account_id: budgetAccountId, date, payee, amount, memo, cleared: "cleared" };
+      const argsObj = { account_id: budgetAccountId, date, amount, memo: memoFull, cleared: "cleared" };
       const res = shJson("mcporter", ["call", "budget.add_transaction", "--args", JSON.stringify(argsObj)]);
-      imported.push({ id, date, payee, amount, memo, result: res });
+      imported.push({ id, date, amount, memo: memoFull, result: res });
     }
 
     return {
